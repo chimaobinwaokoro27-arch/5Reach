@@ -5,6 +5,7 @@ import { useEffect, useState } from 'react';
 import { Search, Plus, Edit2, Loader2, Trash2 } from 'lucide-react';
 import { createContact, deleteContact, listContacts, updateContact } from '@/lib/contacts-data';
 import { findDuplicateContactFields, validatePhoneNumber } from '@/lib/contact-utils';
+import { ACTION_ERROR_CODES } from '@/lib/action-result';
 
 const contactPageSize = 1000;
 const visibleContactPageSize = 10;
@@ -17,20 +18,18 @@ async function fetchAllContacts() {
 
   while (page <= pageCount) {
     const result = await listContacts({ page, pageSize: contactPageSize });
-    contacts.push(...result.contacts);
-    permissions ??= result.permissions;
-    pageCount = result.pagination.pageCount;
+    if (!result.ok) return result;
+    contacts.push(...result.data.contacts);
+    permissions ??= result.data.permissions;
+    pageCount = result.data.pagination.pageCount;
     page += 1;
   }
 
-  return { contacts, permissions };
+  return { ok: true, data: { contacts, permissions } };
 }
 
-function isSignedOutError(error) {
-  return error instanceof Error && (
-    error.message === 'You must be signed in to access contacts.'
-    || error.message === 'Could not verify your sign-in: Auth session missing!'
-  );
+function isSignedOut(result) {
+  return result?.code === ACTION_ERROR_CODES.AUTH_REQUIRED;
 }
 
 export default function ContactsPage() {
@@ -74,24 +73,31 @@ export default function ContactsPage() {
 
       try {
         const loaded = await fetchAllContacts();
-        if (isCurrent) {
-          setContacts(loaded.contacts);
-          setContactPermissions(loaded.permissions ?? {
-            canCreate: false,
-            canUpdate: false,
-            canDelete: false,
-          });
+        if (!isCurrent) return;
+
+        if (!loaded.ok) {
+          setContacts([]);
+          setContactPermissions({ canCreate: false, canUpdate: false, canDelete: false });
+          if (isSignedOut(loaded)) {
+            setIsSignedOut(true);
+          } else {
+            setLoadError(loaded.error || 'Could not load contacts.');
+          }
+          return;
         }
+
+        setContacts(loaded.data.contacts);
+        setContactPermissions(loaded.data.permissions ?? {
+          canCreate: false,
+          canUpdate: false,
+          canDelete: false,
+        });
       } catch (error) {
         if (!isCurrent) return;
 
         setContacts([]);
         setContactPermissions({ canCreate: false, canUpdate: false, canDelete: false });
-        if (isSignedOutError(error)) {
-          setIsSignedOut(true);
-        } else {
-          setLoadError(error instanceof Error ? error.message : 'Could not load contacts.');
-        }
+        setLoadError(error instanceof Error ? error.message : 'Could not load contacts.');
       } finally {
         if (isCurrent) setIsLoadingContacts(false);
       }
@@ -105,11 +111,14 @@ export default function ContactsPage() {
   }, [refreshKey]);
 
   const filteredContacts = contacts.filter((contact) => {
+    const needle = searchTerm.trim().toLowerCase();
     const matchesSearch =
-      (contact.firstName?.toLowerCase().includes(searchTerm.toLowerCase()) || false) ||
-      (contact.lastName?.toLowerCase().includes(searchTerm.toLowerCase()) || false) ||
-      (contact.email?.toLowerCase().includes(searchTerm.toLowerCase()) || false) ||
-      (contact.company?.toLowerCase().includes(searchTerm.toLowerCase()) || false);
+      !needle ||
+      (contact.firstName?.toLowerCase().includes(needle) || false) ||
+      (contact.lastName?.toLowerCase().includes(needle) || false) ||
+      (contact.email?.toLowerCase().includes(needle) || false) ||
+      (contact.phone?.toLowerCase().includes(needle) || false) ||
+      (contact.company?.toLowerCase().includes(needle) || false);
     const matchesStatus = statusFilter === 'all' || contact.status === statusFilter;
     return matchesSearch && matchesStatus;
   });
@@ -123,10 +132,12 @@ export default function ContactsPage() {
   );
 
   const handleSelectAll = (e) => {
+    const visibleIds = visibleContacts.map((contact) => contact.id);
     if (e.target.checked) {
-      setSelectedContacts(visibleContacts.map((contact) => contact.id));
+      // Keep contacts picked on other pages selected.
+      setSelectedContacts((selected) => [...new Set([...selected, ...visibleIds])]);
     } else {
-      setSelectedContacts([]);
+      setSelectedContacts((selected) => selected.filter((id) => !visibleIds.includes(id)));
     }
   };
 
@@ -147,13 +158,18 @@ export default function ContactsPage() {
     setActionFeedback('');
 
     try {
-      await deleteContact(contact.id);
+      const result = await deleteContact(contact.id);
+      if (!result.ok) {
+        setActionError(result.error || 'Could not delete this contact.');
+        if (isSignedOut(result)) setIsSignedOut(true);
+        return;
+      }
+
       setSelectedContacts((selected) => selected.filter((id) => id !== contact.id));
       setActionFeedback('Contact deleted.');
       setRefreshKey((currentKey) => currentKey + 1);
     } catch (error) {
       setActionError(error instanceof Error ? error.message : 'Could not delete this contact.');
-      if (isSignedOutError(error)) setIsSignedOut(true);
     } finally {
       setIsDeleting(false);
     }
@@ -173,21 +189,36 @@ export default function ContactsPage() {
     const results = await Promise.allSettled(
       selectedContacts.map((contactId) => deleteContact(contactId))
     );
-    const deletedIds = results.flatMap((result, index) =>
-      result.status === 'fulfilled' ? [selectedContacts[index]] : []
-    );
-    const failures = results.filter((result) => result.status === 'rejected');
+
+    const deletedIds = [];
+    const failures = [];
+    results.forEach((result, index) => {
+      if (result.status === 'fulfilled' && result.value?.ok) {
+        deletedIds.push(selectedContacts[index]);
+        return;
+      }
+      failures.push(
+        result.status === 'fulfilled'
+          ? result.value
+          : {
+              ok: false,
+              error: result.reason instanceof Error
+                ? result.reason.message
+                : 'Could not delete this contact.',
+            }
+      );
+    });
 
     setSelectedContacts([]);
     if (deletedIds.length) setRefreshKey((currentKey) => currentKey + 1);
 
     if (failures.length) {
-      const firstFailure = failures[0].reason;
-      const reason = firstFailure instanceof Error ? ` ${firstFailure.message}` : '';
+      const firstFailure = failures[0];
+      const reason = firstFailure.error ? ` ${firstFailure.error}` : '';
       setActionError(
         `Deleted ${deletedIds.length} of ${count} selected contacts. ${failures.length} could not be deleted.${reason}`
       );
-      if (failures.some((result) => isSignedOutError(result.reason))) setIsSignedOut(true);
+      if (failures.some((result) => isSignedOut(result))) setIsSignedOut(true);
     } else {
       setActionFeedback(`Deleted ${deletedIds.length} ${label}.`);
     }
@@ -250,10 +281,14 @@ export default function ContactsPage() {
     setActionFeedback('');
 
     try {
-      if (editingContact) {
-        await updateContact(editingContact.id, formData);
-      } else {
-        await createContact(formData);
+      const result = editingContact
+        ? await updateContact(editingContact.id, formData)
+        : await createContact(formData);
+
+      if (!result.ok) {
+        setFormError(result.error || 'Could not save this contact.');
+        if (isSignedOut(result)) setIsSignedOut(true);
+        return;
       }
 
       setIsFormOpen(false);
@@ -262,9 +297,7 @@ export default function ContactsPage() {
       setActionFeedback(editingContact ? 'Contact updated.' : 'Contact created.');
       setRefreshKey((currentKey) => currentKey + 1);
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Could not save this contact.';
-      setFormError(message);
-      if (isSignedOutError(error)) setIsSignedOut(true);
+      setFormError(error instanceof Error ? error.message : 'Could not save this contact.');
     } finally {
       setIsLoading(false);
     }

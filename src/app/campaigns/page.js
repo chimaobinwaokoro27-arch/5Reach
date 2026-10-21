@@ -18,6 +18,7 @@ import {
   validateCampaignStatus,
   toScheduledAtIso,
 } from '@/lib/campaign-utils';
+import { ACTION_ERROR_CODES } from '@/lib/action-result';
 
 const campaignPageSize = 1000;
 
@@ -29,13 +30,14 @@ async function fetchAllCampaigns() {
 
   while (page <= pageCount) {
     const result = await listCampaigns({ page, pageSize: campaignPageSize });
-    campaigns.push(...result.campaigns);
-    permissions ??= result.permissions;
-    pageCount = result.pagination.pageCount;
+    if (!result.ok) return result;
+    campaigns.push(...result.data.campaigns);
+    permissions ??= result.data.permissions;
+    pageCount = result.data.pagination.pageCount;
     page += 1;
   }
 
-  return { campaigns, permissions };
+  return { ok: true, data: { campaigns, permissions } };
 }
 
 async function fetchAllRecipientContacts() {
@@ -45,19 +47,17 @@ async function fetchAllRecipientContacts() {
 
   while (page <= pageCount) {
     const result = await listCampaignRecipientContacts({ page, pageSize: campaignPageSize });
-    contacts.push(...result.contacts);
-    pageCount = result.pagination.pageCount;
+    if (!result.ok) return result;
+    contacts.push(...result.data.contacts);
+    pageCount = result.data.pagination.pageCount;
     page += 1;
   }
 
-  return contacts;
+  return { ok: true, data: contacts };
 }
 
-function isSignedOutError(error) {
-  return error instanceof Error && (
-    error.message === 'You must be signed in to access campaigns.'
-    || error.message === 'Could not verify your sign-in: Auth session missing!'
-  );
+function isSignedOut(result) {
+  return result?.code === ACTION_ERROR_CODES.AUTH_REQUIRED;
 }
 
 function formatScheduledAt(value) {
@@ -121,24 +121,31 @@ export default function CampaignsPage() {
 
       try {
         const loaded = await fetchAllCampaigns();
-        if (isCurrent) {
-          setCampaigns(loaded.campaigns);
-          setCampaignPermissions(loaded.permissions ?? {
-            canManage: false,
-            canDelete: false,
-            canRemoveRecipients: false,
-          });
+        if (!isCurrent) return;
+
+        if (!loaded.ok) {
+          setCampaigns([]);
+          setCampaignPermissions({ canManage: false, canDelete: false, canRemoveRecipients: false });
+          if (isSignedOut(loaded)) {
+            setIsSignedOut(true);
+          } else {
+            setLoadError(loaded.error || 'Could not load campaigns.');
+          }
+          return;
         }
+
+        setCampaigns(loaded.data.campaigns);
+        setCampaignPermissions(loaded.data.permissions ?? {
+          canManage: false,
+          canDelete: false,
+          canRemoveRecipients: false,
+        });
       } catch (error) {
         if (!isCurrent) return;
 
         setCampaigns([]);
         setCampaignPermissions({ canManage: false, canDelete: false, canRemoveRecipients: false });
-        if (isSignedOutError(error)) {
-          setIsSignedOut(true);
-        } else {
-          setLoadError(error instanceof Error ? error.message : 'Could not load campaigns.');
-        }
+        setLoadError(error instanceof Error ? error.message : 'Could not load campaigns.');
       } finally {
         if (isCurrent) setIsLoadingCampaigns(false);
       }
@@ -162,7 +169,15 @@ export default function CampaignsPage() {
 
       try {
         const loadedContacts = await fetchAllRecipientContacts();
-        if (isCurrent) setContacts(loadedContacts);
+        if (!isCurrent) return;
+
+        if (!loadedContacts.ok) {
+          setContacts([]);
+          setContactsError(loadedContacts.error || 'Could not load contacts.');
+          return;
+        }
+
+        setContacts(loadedContacts.data);
       } catch (error) {
         if (!isCurrent) return;
 
@@ -181,11 +196,14 @@ export default function CampaignsPage() {
   }, [isFormOpen, contactsRefreshKey]);
 
   const filteredRecipients = contacts.filter((contact) => {
+    const needle = recipientSearch.trim().toLowerCase();
     const matchesSearch =
-      (contact.firstName?.toLowerCase().includes(recipientSearch.toLowerCase()) || false) ||
-      (contact.lastName?.toLowerCase().includes(recipientSearch.toLowerCase()) || false) ||
-      (contact.email?.toLowerCase().includes(recipientSearch.toLowerCase()) || false) ||
-      (contact.company?.toLowerCase().includes(recipientSearch.toLowerCase()) || false);
+      !needle ||
+      (contact.firstName?.toLowerCase().includes(needle) || false) ||
+      (contact.lastName?.toLowerCase().includes(needle) || false) ||
+      (contact.email?.toLowerCase().includes(needle) || false) ||
+      (contact.phone?.toLowerCase().includes(needle) || false) ||
+      (contact.company?.toLowerCase().includes(needle) || false);
     return matchesSearch;
   });
 
@@ -216,6 +234,11 @@ export default function CampaignsPage() {
       return;
     }
 
+    if (statusValidation.value === 'scheduled' && !scheduleValidation.value) {
+      setFormError('A scheduled campaign needs a schedule date and time.');
+      return;
+    }
+
     if (selectedRecipients.length === 0) {
       setFormError('Select at least one recipient.');
       return;
@@ -234,10 +257,14 @@ export default function CampaignsPage() {
         scheduledAt: scheduleValidation.value,
       };
 
-      if (editingCampaign) {
-        await updateCampaign(editingCampaign.id, campaignChanges, selectedRecipients);
-      } else {
-        await createCampaign(campaignChanges, selectedRecipients);
+      const result = editingCampaign
+        ? await updateCampaign(editingCampaign.id, campaignChanges, selectedRecipients)
+        : await createCampaign(campaignChanges, selectedRecipients);
+
+      if (!result.ok) {
+        setFormError(result.error || 'Could not save the campaign.');
+        if (isSignedOut(result)) setIsSignedOut(true);
+        return;
       }
 
       setIsFormOpen(false);
@@ -250,7 +277,6 @@ export default function CampaignsPage() {
       setCampaignRefreshKey((currentKey) => currentKey + 1);
     } catch (error) {
       setFormError(error instanceof Error ? error.message : 'Could not save the campaign.');
-      if (isSignedOutError(error)) setIsSignedOut(true);
     } finally {
       setIsLoading(false);
     }
@@ -319,8 +345,14 @@ export default function CampaignsPage() {
 
     try {
       const recipientIds = await listCampaignRecipientIds(campaign.id);
-      setCurrentRecipientIds(recipientIds);
-      setSelectedRecipients(recipientIds);
+      if (!recipientIds.ok) {
+        setFormError(recipientIds.error || 'Could not load current recipients.');
+        if (isSignedOut(recipientIds)) setIsSignedOut(true);
+        return;
+      }
+
+      setCurrentRecipientIds(recipientIds.data);
+      setSelectedRecipients(recipientIds.data);
     } catch (error) {
       setFormError(error instanceof Error ? error.message : 'Could not load current recipients.');
     } finally {
@@ -336,12 +368,17 @@ export default function CampaignsPage() {
     setSuccessMessage('');
 
     try {
-      await deleteCampaign(campaign.id);
+      const result = await deleteCampaign(campaign.id);
+      if (!result.ok) {
+        setActionError(result.error || 'Could not delete the campaign.');
+        if (isSignedOut(result)) setIsSignedOut(true);
+        return;
+      }
+
       setSuccessMessage('Campaign deleted successfully.');
       setCampaignRefreshKey((currentKey) => currentKey + 1);
     } catch (error) {
       setActionError(error instanceof Error ? error.message : 'Could not delete the campaign.');
-      if (isSignedOutError(error)) setIsSignedOut(true);
     } finally {
       setIsDeletingCampaign(false);
     }
@@ -560,6 +597,10 @@ export default function CampaignsPage() {
                     onChange={(e) => setFormData({ ...formData, scheduledAt: e.target.value })}
                     className="w-full px-3 py-2 bg-[#151719] border border-[#2A2C30] rounded-lg text-sm text-[#F3EFE8] focus:outline-none focus:ring-2 focus:ring-[#E8793E] focus:border-transparent"
                   />
+                  <p className="mt-1 text-xs text-[#92979D]">
+                    The schedule is recorded with the campaign. No messaging provider is connected yet,
+                    so setting a schedule does not send any SMS or email.
+                  </p>
                 </div>
                 <div>
                   <label htmlFor="campaign-status" className="block text-sm font-medium text-[#F3EFE8] mb-1">Status</label>

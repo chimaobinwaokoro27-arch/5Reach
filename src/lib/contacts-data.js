@@ -1,12 +1,15 @@
 "use server";
 
 import { createClient } from "@/lib/supabase/server";
+import { ACTION_ERROR_CODES, actionFailure, actionSuccess } from "@/lib/action-result";
 import {
   findDuplicateContactFields,
   fromContactRecord,
   getPageCount,
   getPaginationOffset,
   toContactRecord,
+  validateContactEmail,
+  validateContactStatus,
   validatePhoneNumber,
 } from "@/lib/contact-utils";
 
@@ -18,10 +21,16 @@ async function resolveContactContext(client) {
   const { data: authData, error: authError } = await client.auth.getUser();
 
   if (authError) {
-    throw new Error(`Could not verify your sign-in: ${authError.message}`);
+    return actionFailure(
+      "Could not verify your sign-in. Please sign in again.",
+      ACTION_ERROR_CODES.AUTH_REQUIRED
+    );
   }
   if (!authData.user) {
-    throw new Error("You must be signed in to access contacts.");
+    return actionFailure(
+      "You must be signed in to access contacts.",
+      ACTION_ERROR_CODES.AUTH_REQUIRED
+    );
   }
 
   const { data: memberships, error: membershipError } = await client
@@ -30,31 +39,73 @@ async function resolveContactContext(client) {
     .eq("user_id", authData.user.id);
 
   if (membershipError) {
-    throw new Error(`Could not load your organization membership: ${membershipError.message}`);
+    console.error("contacts: could not load organization membership", membershipError);
+    return actionFailure("Could not load your organization. Please try again.");
   }
   if (!memberships?.length) {
-    throw new Error("Your account is not a member of an organization.");
+    return actionFailure("Your account is not a member of an organization.");
   }
   if (memberships.length > 1) {
-    throw new Error("Your account belongs to multiple organizations. Select an organization before managing contacts.");
+    return actionFailure(
+      "Your account belongs to multiple organizations. Select an organization before managing contacts.",
+      ACTION_ERROR_CODES.VALIDATION
+    );
   }
 
   return {
-    user: authData.user,
-    organizationId: memberships[0].organization_id,
-    role: memberships[0].role,
+    ok: true,
+    data: {
+      user: authData.user,
+      organizationId: memberships[0].organization_id,
+      role: memberships[0].role,
+    },
   };
 }
 
 function requireContactRole(role, allowedRoles) {
   if (!allowedRoles.includes(role)) {
-    throw new Error("You do not have permission to perform this contact action.");
+    return actionFailure(
+      "You do not have permission to perform this contact action.",
+      ACTION_ERROR_CODES.PERMISSION_DENIED
+    );
   }
+  return null;
 }
 
-function validateContactPhone(contact) {
-  const result = validatePhoneNumber(contact.phone);
-  if (!result.valid) throw new Error(result.error);
+/**
+ * Validates the parts of a contact the client can change.
+ * Returns a failure result, or null when the input is acceptable.
+ */
+function validateContactInput(changes, { requireFirstName = false } = {}) {
+  const phoneResult = validatePhoneNumber(changes.phone);
+  if (!phoneResult.valid) {
+    return actionFailure(phoneResult.error, ACTION_ERROR_CODES.VALIDATION);
+  }
+
+  const emailResult = validateContactEmail(changes.email);
+  if (!emailResult.valid) {
+    return actionFailure(emailResult.error, ACTION_ERROR_CODES.VALIDATION);
+  }
+
+  if (requireFirstName || Object.hasOwn(changes, "firstName")) {
+    if (!changes.firstName?.trim()) {
+      return actionFailure(
+        requireFirstName
+          ? "A first name is required to create a contact."
+          : "A contact's first name cannot be empty.",
+        ACTION_ERROR_CODES.VALIDATION
+      );
+    }
+  }
+
+  if (Object.hasOwn(changes, "status") && changes.status !== undefined) {
+    const statusResult = validateContactStatus(changes.status);
+    if (!statusResult.valid) {
+      return actionFailure(statusResult.error, ACTION_ERROR_CODES.VALIDATION);
+    }
+  }
+
+  return null;
 }
 
 async function findOrganizationDuplicates(client, organizationId, contact, ignoredContactId) {
@@ -92,16 +143,22 @@ async function findOrganizationDuplicates(client, organizationId, contact, ignor
   return findDuplicateContactFields(contact, existingContacts, ignoredContactId);
 }
 
-function throwForDuplicates(fields) {
-  if (!fields.length) return;
+function duplicateFailure(fields) {
+  if (!fields.length) return null;
 
-  const labels = fields.map((field) => field === "email" ? "email address" : "phone number");
-  throw new Error(`A contact with this ${labels.join(" and ")} already exists in your organization.`);
+  const labels = fields.map((field) => (field === "email" ? "email address" : "phone number"));
+  return actionFailure(
+    `A contact with this ${labels.join(" and ")} already exists in your organization.`,
+    ACTION_ERROR_CODES.CONFLICT
+  );
 }
 
 export async function listContacts({ page = 1, pageSize = 20, status } = {}) {
   const client = await createClient();
-  const { organizationId, role } = await resolveContactContext(client);
+  const context = await resolveContactContext(client);
+  if (!context.ok) return context;
+
+  const { organizationId, role } = context.data;
   const requestedPage = Number(page);
   const requestedPageSize = Number(pageSize);
   const safePage = Number.isFinite(requestedPage)
@@ -122,9 +179,12 @@ export async function listContacts({ page = 1, pageSize = 20, status } = {}) {
   if (status) query = query.eq("status", status);
 
   const { data, count, error } = await query.range(offset, offset + safePageSize - 1);
-  if (error) throw new Error(`Could not load contacts: ${error.message}`);
+  if (error) {
+    console.error("contacts: could not load contacts", error);
+    return actionFailure("Could not load contacts. Please try again.");
+  }
 
-  return {
+  return actionSuccess({
     contacts: (data ?? []).map(fromContactRecord),
     pagination: {
       page: safePage,
@@ -138,100 +198,146 @@ export async function listContacts({ page = 1, pageSize = 20, status } = {}) {
       canUpdate: contactWriteRoles.includes(role),
       canDelete: contactDeleteRoles.includes(role),
     },
-  };
+  });
 }
 
 export async function createContact(contact) {
   const client = await createClient();
   const context = await resolveContactContext(client);
-  requireContactRole(context.role, contactWriteRoles);
-  validateContactPhone(contact);
+  if (!context.ok) return context;
 
-  if (!contact.firstName?.trim()) {
-    throw new Error("A first name is required to create a contact.");
+  const roleFailure = requireContactRole(context.data.role, contactWriteRoles);
+  if (roleFailure) return roleFailure;
+
+  const inputFailure = validateContactInput(contact, { requireFirstName: true });
+  if (inputFailure) return inputFailure;
+
+  let duplicateFields;
+  try {
+    duplicateFields = await findOrganizationDuplicates(
+      client,
+      context.data.organizationId,
+      contact
+    );
+  } catch (error) {
+    console.error("contacts: could not check for duplicate contacts", error);
+    return actionFailure("Could not check for duplicate contacts. Please try again.");
   }
 
-  const duplicateFields = await findOrganizationDuplicates(
-    client,
-    context.organizationId,
-    contact
-  );
-  throwForDuplicates(duplicateFields);
+  const duplicate = duplicateFailure(duplicateFields);
+  if (duplicate) return duplicate;
 
   const { data, error } = await client
     .from("contacts")
     .insert({
       ...toContactRecord(contact),
-      organization_id: context.organizationId,
-      created_by: context.user.id,
+      organization_id: context.data.organizationId,
+      created_by: context.data.user.id,
     })
     .select("*")
     .single();
 
-  if (error) throw new Error(`Could not create contact: ${error.message}`);
-  return fromContactRecord(data);
+  if (error) {
+    console.error("contacts: could not create contact", error);
+    return actionFailure("Could not create the contact. Please try again.");
+  }
+  return actionSuccess(fromContactRecord(data));
 }
 
 export async function updateContact(contactId, changes) {
   const client = await createClient();
   const context = await resolveContactContext(client);
-  requireContactRole(context.role, contactWriteRoles);
-  validateContactPhone(changes);
+  if (!context.ok) return context;
 
-  if (Object.hasOwn(changes, "firstName") && !changes.firstName?.trim()) {
-    throw new Error("A contact's first name cannot be empty.");
-  }
+  const roleFailure = requireContactRole(context.data.role, contactWriteRoles);
+  if (roleFailure) return roleFailure;
+
+  const inputFailure = validateContactInput(changes);
+  if (inputFailure) return inputFailure;
 
   const { data: existingContact, error: lookupError } = await client
     .from("contacts")
     .select("id")
     .eq("id", contactId)
-    .eq("organization_id", context.organizationId)
+    .eq("organization_id", context.data.organizationId)
     .maybeSingle();
 
-  if (lookupError) throw new Error(`Could not find the contact to update: ${lookupError.message}`);
-  if (!existingContact) throw new Error("That contact was not found in your organization.");
+  if (lookupError) {
+    console.error("contacts: could not look up the contact to update", lookupError);
+    return actionFailure("Could not find the contact to update. Please try again.");
+  }
+  if (!existingContact) {
+    return actionFailure(
+      "That contact was not found in your organization.",
+      ACTION_ERROR_CODES.NOT_FOUND
+    );
+  }
 
-  const duplicateFields = await findOrganizationDuplicates(
-    client,
-    context.organizationId,
-    changes,
-    contactId
-  );
-  throwForDuplicates(duplicateFields);
+  let duplicateFields;
+  try {
+    duplicateFields = await findOrganizationDuplicates(
+      client,
+      context.data.organizationId,
+      changes,
+      contactId
+    );
+  } catch (error) {
+    console.error("contacts: could not check for duplicate contacts", error);
+    return actionFailure("Could not check for duplicate contacts. Please try again.");
+  }
+
+  const duplicate = duplicateFailure(duplicateFields);
+  if (duplicate) return duplicate;
 
   const contactChanges = toContactRecord(changes);
   if (!Object.keys(contactChanges).length) {
-    throw new Error("Provide at least one contact field to update.");
+    return actionFailure(
+      "Provide at least one contact field to update.",
+      ACTION_ERROR_CODES.VALIDATION
+    );
   }
 
   const { data, error } = await client
     .from("contacts")
-    .update(contactChanges)
+    .update({ ...contactChanges, updated_at: new Date().toISOString() })
     .eq("id", contactId)
-    .eq("organization_id", context.organizationId)
+    .eq("organization_id", context.data.organizationId)
     .select("*")
     .single();
 
-  if (error) throw new Error(`Could not update contact: ${error.message}`);
-  return fromContactRecord(data);
+  if (error) {
+    console.error("contacts: could not update contact", error);
+    return actionFailure("Could not update the contact. Please try again.");
+  }
+  return actionSuccess(fromContactRecord(data));
 }
 
 export async function deleteContact(contactId) {
   const client = await createClient();
   const context = await resolveContactContext(client);
-  requireContactRole(context.role, contactDeleteRoles);
+  if (!context.ok) return context;
+
+  const roleFailure = requireContactRole(context.data.role, contactDeleteRoles);
+  if (roleFailure) return roleFailure;
 
   const { data, error } = await client
     .from("contacts")
     .delete()
     .eq("id", contactId)
-    .eq("organization_id", context.organizationId)
+    .eq("organization_id", context.data.organizationId)
     .select("id")
     .maybeSingle();
 
-  if (error) throw new Error(`Could not delete contact: ${error.message}`);
-  if (!data) throw new Error("That contact was not found in your organization.");
+  if (error) {
+    console.error("contacts: could not delete contact", error);
+    return actionFailure("Could not delete the contact. Please try again.");
+  }
+  if (!data) {
+    return actionFailure(
+      "That contact was not found in your organization.",
+      ACTION_ERROR_CODES.NOT_FOUND
+    );
+  }
 
-  return data.id;
+  return actionSuccess(data.id);
 }

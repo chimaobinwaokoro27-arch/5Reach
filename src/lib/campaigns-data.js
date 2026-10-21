@@ -1,6 +1,7 @@
 "use server";
 
 import { createClient } from "@/lib/supabase/server";
+import { ACTION_ERROR_CODES, actionFailure, actionSuccess } from "@/lib/action-result";
 import { fromContactRecord } from "@/lib/contact-utils";
 import {
   fromCampaignRecord,
@@ -28,10 +29,16 @@ async function resolveCampaignContext(client) {
   const { data: authData, error: authError } = await client.auth.getUser();
 
   if (authError) {
-    throw new Error(`Could not verify your sign-in: ${authError.message}`);
+    return actionFailure(
+      "Could not verify your sign-in. Please sign in again.",
+      ACTION_ERROR_CODES.AUTH_REQUIRED
+    );
   }
   if (!authData.user) {
-    throw new Error("You must be signed in to access campaigns.");
+    return actionFailure(
+      "You must be signed in to access campaigns.",
+      ACTION_ERROR_CODES.AUTH_REQUIRED
+    );
   }
 
   const { data: memberships, error: membershipError } = await client
@@ -40,55 +47,89 @@ async function resolveCampaignContext(client) {
     .eq("user_id", authData.user.id);
 
   if (membershipError) {
-    throw new Error(`Could not load your organization membership: ${membershipError.message}`);
+    console.error("campaigns: could not load organization membership", membershipError);
+    return actionFailure("Could not load your organization. Please try again.");
   }
   if (!memberships?.length) {
-    throw new Error("Your account is not a member of an organization.");
+    return actionFailure("Your account is not a member of an organization.");
   }
   if (memberships.length > 1) {
-    throw new Error("Your account belongs to multiple organizations. Select an organization before managing campaigns.");
+    return actionFailure(
+      "Your account belongs to multiple organizations. Select an organization before managing campaigns.",
+      ACTION_ERROR_CODES.VALIDATION
+    );
   }
 
   return {
-    user: authData.user,
-    organizationId: memberships[0].organization_id,
-    role: memberships[0].role,
+    ok: true,
+    data: {
+      user: authData.user,
+      organizationId: memberships[0].organization_id,
+      role: memberships[0].role,
+    },
   };
 }
 
 function requireCampaignRole(role, allowedRoles) {
   if (!allowedRoles.includes(role)) {
-    throw new Error("You do not have permission to perform this campaign action.");
+    return actionFailure(
+      "You do not have permission to perform this campaign action.",
+      ACTION_ERROR_CODES.PERMISSION_DENIED
+    );
   }
+  return null;
 }
 
+/**
+ * Validates and normalizes the campaign fields the client may send.
+ * Returns { record } on success, or { error } with a user-safe message.
+ */
 function normalizeCampaignInput(campaign, { partial = false } = {}) {
   if (!campaign || typeof campaign !== "object" || Array.isArray(campaign)) {
-    throw new Error("Campaign details must be provided as an object.");
+    return {
+      error: actionFailure(
+        "Campaign details must be provided as an object.",
+        ACTION_ERROR_CODES.VALIDATION
+      ),
+    };
   }
 
   const unsupportedFields = Object.keys(campaign).filter((field) => !campaignInputFields.has(field));
   if (unsupportedFields.length) {
-    throw new Error(`Unsupported campaign field: ${unsupportedFields.join(", ")}.`);
+    return {
+      error: actionFailure(
+        `Unsupported campaign field: ${unsupportedFields.join(", ")}.`,
+        ACTION_ERROR_CODES.VALIDATION
+      ),
+    };
   }
 
   const normalized = { ...campaign };
 
   if (!partial || Object.hasOwn(campaign, "name")) {
     const result = validateCampaignName(campaign.name);
-    if (!result.valid) throw new Error(result.error);
+    if (!result.valid) {
+      return { error: actionFailure(result.error, ACTION_ERROR_CODES.VALIDATION) };
+    }
     normalized.name = result.value;
   }
 
   if (!partial || Object.hasOwn(campaign, "channel")) {
     const result = validateCampaignChannel(campaign.channel);
-    if (!result.valid) throw new Error(result.error);
+    if (!result.valid) {
+      return { error: actionFailure(result.error, ACTION_ERROR_CODES.VALIDATION) };
+    }
   }
 
   if (Object.hasOwn(campaign, "description")
     && campaign.description !== null
     && typeof campaign.description !== "string") {
-    throw new Error("Campaign description must be text or empty.");
+    return {
+      error: actionFailure(
+        "Campaign description must be text or empty.",
+        ACTION_ERROR_CODES.VALIDATION
+      ),
+    };
   }
 
   if (!partial || Object.hasOwn(campaign, "status")) {
@@ -96,34 +137,48 @@ function normalizeCampaignInput(campaign, { partial = false } = {}) {
       ? "draft"
       : campaign.status;
     const result = validateCampaignStatus(status);
-    if (!result.valid) throw new Error(result.error);
+    if (!result.valid) {
+      return { error: actionFailure(result.error, ACTION_ERROR_CODES.VALIDATION) };
+    }
     normalized.status = status;
   }
 
   if (Object.hasOwn(campaign, "scheduledAt")) {
     const result = toScheduledAtIso(campaign.scheduledAt);
-    if (!result.valid) throw new Error(result.error);
+    if (!result.valid) {
+      return { error: actionFailure(result.error, ACTION_ERROR_CODES.VALIDATION) };
+    }
     normalized.scheduledAt = result.value;
   }
 
-  return toCampaignRecord(normalized);
+  return { record: toCampaignRecord(normalized) };
 }
 
 function normalizeRecipientContactIds(contactIds) {
   if (!Array.isArray(contactIds)) {
-    throw new Error("Campaign recipient contact IDs must be provided as a list.");
+    return {
+      error: actionFailure(
+        "Campaign recipient contact IDs must be provided as a list.",
+        ACTION_ERROR_CODES.VALIDATION
+      ),
+    };
   }
 
   const uniqueIds = [...new Set(contactIds)];
   if (uniqueIds.some((id) => typeof id !== "string" || !id.trim())) {
-    throw new Error("Every campaign recipient must have a valid contact ID.");
+    return {
+      error: actionFailure(
+        "Every campaign recipient must have a valid contact ID.",
+        ACTION_ERROR_CODES.VALIDATION
+      ),
+    };
   }
 
-  return uniqueIds;
+  return { ids: uniqueIds };
 }
 
 async function validateOrganizationContacts(client, organizationId, contactIds) {
-  if (!contactIds.length) return;
+  if (!contactIds.length) return null;
 
   const { data, error } = await client
     .from("contacts")
@@ -132,18 +187,24 @@ async function validateOrganizationContacts(client, organizationId, contactIds) 
     .in("id", contactIds);
 
   if (error) {
-    throw new Error(`Could not validate campaign contacts: ${error.message}`);
+    console.error("campaigns: could not validate campaign contacts", error);
+    return actionFailure("Could not validate the selected contacts. Please try again.");
   }
 
   const foundIds = new Set((data ?? []).map((contact) => contact.id));
   const missingIds = contactIds.filter((contactId) => !foundIds.has(contactId));
   if (missingIds.length) {
-    throw new Error("One or more selected contacts do not belong to your organization or are unavailable.");
+    return actionFailure(
+      "One or more selected contacts do not belong to your organization or are unavailable.",
+      ACTION_ERROR_CODES.VALIDATION
+    );
   }
+
+  return null;
 }
 
 async function insertRecipientAssociations(client, organizationId, campaignId, contactIds) {
-  if (!contactIds.length) return;
+  if (!contactIds.length) return null;
 
   const recipientRows = contactIds.map((contactId) => ({
     organization_id: organizationId,
@@ -154,12 +215,24 @@ async function insertRecipientAssociations(client, organizationId, campaignId, c
 
   const { error } = await client.from("campaign_contacts").insert(recipientRows);
   if (error) {
-    throw new Error(`Could not save campaign recipients: ${error.message}`);
+    console.error("campaigns: could not save campaign recipients", error);
+    return actionFailure("Could not save the campaign recipients. Please try again.");
   }
+
+  return null;
 }
 
+/**
+ * Removes the given recipients.
+ *
+ * Returns { removedIds, missingIds } instead of throwing, because a removal
+ * can partially succeed: rows the caller is not allowed to delete are skipped
+ * by Row Level Security rather than raising an error. The caller needs the
+ * list of rows that really were deleted so it can put them back if the
+ * overall update has to be rolled back.
+ */
 async function removeRecipientAssociations(client, organizationId, campaignId, contactIds) {
-  if (!contactIds.length) return;
+  if (!contactIds.length) return { removedIds: [], missingIds: [] };
 
   const { data, error } = await client
     .from("campaign_contacts")
@@ -170,13 +243,18 @@ async function removeRecipientAssociations(client, organizationId, campaignId, c
     .select("contact_id");
 
   if (error) {
-    throw new Error(`Could not remove campaign recipients: ${error.message}`);
+    console.error("campaigns: could not remove campaign recipients", error);
+    return {
+      removedIds: [],
+      missingIds: contactIds,
+      error: actionFailure("Could not remove the campaign recipients. Please try again."),
+    };
   }
 
-  const removedIds = new Set((data ?? []).map((row) => row.contact_id));
-  if (contactIds.some((contactId) => !removedIds.has(contactId))) {
-    throw new Error("Some campaign recipients could not be removed. Check your ADMIN permissions and try again.");
-  }
+  const removedIds = [...new Set((data ?? []).map((row) => row.contact_id))];
+  const missingIds = contactIds.filter((contactId) => !removedIds.includes(contactId));
+
+  return { removedIds, missingIds, error: null };
 }
 
 async function fetchCampaignRecipientCounts(client, organizationId, campaignIds) {
@@ -200,7 +278,8 @@ async function fetchCampaignRecipientCounts(client, organizationId, campaignIds)
       offset + queryBatchSize - 1
     );
     if (error) {
-      throw new Error(`Could not load campaign recipient counts: ${error.message}`);
+      console.error("campaigns: could not load campaign recipient counts", error);
+      return actionFailure("Could not load the campaign recipient counts. Please try again.");
     }
 
     for (const row of data ?? []) {
@@ -228,7 +307,8 @@ async function listExistingRecipientIds(client, organizationId, campaignId) {
       .range(offset, offset + queryBatchSize - 1);
 
     if (error) {
-      throw new Error(`Could not load current campaign recipients: ${error.message}`);
+      console.error("campaigns: could not load current campaign recipients", error);
+      return actionFailure("Could not load the current campaign recipients. Please try again.");
     }
 
     contactIds.push(...(data ?? []).map((row) => row.contact_id));
@@ -279,6 +359,26 @@ async function cleanupAddedRecipients(client, organizationId, campaignId, contac
   return null;
 }
 
+/**
+ * Puts back recipients that were removed before a later step failed.
+ * Without this a partially applied update would silently drop recipients.
+ */
+async function restoreRemovedRecipients(client, organizationId, campaignId, contactIds) {
+  if (!contactIds.length) return null;
+
+  const recipientRows = contactIds.map((contactId) => ({
+    organization_id: organizationId,
+    campaign_id: campaignId,
+    contact_id: contactId,
+    status: "pending",
+  }));
+
+  const { error } = await client.from("campaign_contacts").insert(recipientRows);
+  if (error) return error.message;
+
+  return null;
+}
+
 function safePageValues(page, pageSize) {
   const requestedPage = Number(page);
   const requestedPageSize = Number(pageSize);
@@ -296,10 +396,27 @@ function safePageValues(page, pageSize) {
   };
 }
 
+/**
+ * A campaign that says "scheduled" must have a date to run on. The check uses
+ * the value that will actually be stored, so editing an already scheduled
+ * campaign without touching its date keeps working.
+ */
+function scheduledDateFailure(status, scheduledAt) {
+  if (status === "scheduled" && !scheduledAt) {
+    return actionFailure(
+      "A scheduled campaign needs a schedule date and time.",
+      ACTION_ERROR_CODES.VALIDATION
+    );
+  }
+  return null;
+}
+
 export async function listCampaigns({ page = 1, pageSize = 20, status } = {}) {
   const client = await createClient();
   const context = await resolveCampaignContext(client);
-  const { organizationId } = context;
+  if (!context.ok) return context;
+
+  const { organizationId, role } = context.data;
   const pagination = safePageValues(page, pageSize);
 
   let query = client
@@ -311,7 +428,9 @@ export async function listCampaigns({ page = 1, pageSize = 20, status } = {}) {
 
   if (status != null && status !== "") {
     const result = validateCampaignStatus(status);
-    if (!result.valid) throw new Error(result.error);
+    if (!result.valid) {
+      return actionFailure(result.error, ACTION_ERROR_CODES.VALIDATION);
+    }
     query = query.eq("status", status);
   }
 
@@ -319,19 +438,23 @@ export async function listCampaigns({ page = 1, pageSize = 20, status } = {}) {
     pagination.offset,
     pagination.offset + pagination.pageSize - 1
   );
-  if (error) throw new Error(`Could not load campaigns: ${error.message}`);
+  if (error) {
+    console.error("campaigns: could not load campaigns", error);
+    return actionFailure("Could not load campaigns. Please try again.");
+  }
 
   const campaigns = (data ?? []).map(fromCampaignRecord);
-  const countsByCampaignId = await fetchCampaignRecipientCounts(
+  const counts = await fetchCampaignRecipientCounts(
     client,
     organizationId,
     campaigns.map((campaign) => campaign.id)
   );
+  if (counts && counts.ok === false) return counts;
 
-  return {
+  return actionSuccess({
     campaigns: campaigns.map((campaign) => ({
       ...campaign,
-      recipientCount: countsByCampaignId[campaign.id] ?? 0,
+      recipientCount: counts?.[campaign.id] ?? 0,
     })),
     pagination: {
       ...pagination,
@@ -339,89 +462,137 @@ export async function listCampaigns({ page = 1, pageSize = 20, status } = {}) {
       pageCount: getPageCount(count ?? 0, pagination.pageSize),
     },
     permissions: {
-      canManage: campaignWriteRoles.includes(context.role),
-      canDelete: campaignDeleteRoles.includes(context.role),
-      canRemoveRecipients: campaignDeleteRoles.includes(context.role),
+      canManage: campaignWriteRoles.includes(role),
+      canDelete: campaignDeleteRoles.includes(role),
+      canRemoveRecipients: campaignDeleteRoles.includes(role),
     },
-  };
+  });
 }
 
 export async function createCampaign(campaign, recipientContactIds = []) {
   const client = await createClient();
   const context = await resolveCampaignContext(client);
-  requireCampaignRole(context.role, campaignWriteRoles);
+  if (!context.ok) return context;
 
-  const campaignRecord = normalizeCampaignInput(campaign);
-  const contactIds = normalizeRecipientContactIds(recipientContactIds);
-  await validateOrganizationContacts(client, context.organizationId, contactIds);
+  const roleFailure = requireCampaignRole(context.data.role, campaignWriteRoles);
+  if (roleFailure) return roleFailure;
+
+  const normalized = normalizeCampaignInput(campaign);
+  if (normalized.error) return normalized.error;
+  const campaignRecord = normalized.record;
+
+  const normalizedRecipients = normalizeRecipientContactIds(recipientContactIds);
+  if (normalizedRecipients.error) return normalizedRecipients.error;
+  const contactIds = normalizedRecipients.ids;
+
+  const dateFailure = scheduledDateFailure(
+    campaignRecord.status,
+    campaignRecord.scheduled_at
+  );
+  if (dateFailure) return dateFailure;
+
+  const contactFailure = await validateOrganizationContacts(
+    client,
+    context.data.organizationId,
+    contactIds
+  );
+  if (contactFailure) return contactFailure;
 
   const { data: createdCampaign, error: createError } = await client
     .from("campaigns")
     .insert({
       ...campaignRecord,
-      organization_id: context.organizationId,
-      created_by: context.user.id,
+      organization_id: context.data.organizationId,
+      created_by: context.data.user.id,
     })
     .select("*")
     .single();
 
-  if (createError) throw new Error(`Could not create campaign: ${createError.message}`);
+  if (createError) {
+    console.error("campaigns: could not create campaign", createError);
+    return actionFailure("Could not create the campaign. Please try again.");
+  }
 
-  try {
-    await insertRecipientAssociations(
-      client,
-      context.organizationId,
-      createdCampaign.id,
-      contactIds
-    );
-  } catch (recipientError) {
+  const recipientFailure = await insertRecipientAssociations(
+    client,
+    context.data.organizationId,
+    createdCampaign.id,
+    contactIds
+  );
+
+  if (recipientFailure) {
     const cleanup = await client
       .from("campaigns")
       .delete()
       .eq("id", createdCampaign.id)
-      .eq("organization_id", context.organizationId)
+      .eq("organization_id", context.data.organizationId)
       .select("id")
       .maybeSingle();
 
-    const associationMessage = recipientError instanceof Error
-      ? recipientError.message
-      : "Could not save campaign recipients.";
-
     if (cleanup.error || !cleanup.data) {
-      const cleanupMessage = cleanup.error?.message ?? "The campaign could not be removed.";
-      throw new Error(
-        `Campaign recipients were not saved, and campaign cleanup failed (${cleanupMessage}). The campaign may remain without all recipients. Original error: ${associationMessage}`
+      console.error(
+        "campaigns: recipient insert failed and the campaign cleanup also failed",
+        cleanup.error
+      );
+      return actionFailure(
+        "The campaign recipients were not saved and the campaign could not be removed automatically. Please delete the empty campaign and try again."
       );
     }
 
-    throw new Error(`Campaign was not created because recipient associations failed: ${associationMessage}`);
+    return actionFailure(
+      "The campaign was not created because its recipients could not be saved. Please try again."
+    );
   }
 
-  return {
+  return actionSuccess({
     ...fromCampaignRecord(createdCampaign),
     recipientCount: contactIds.length,
-  };
+  });
 }
 
 export async function updateCampaign(campaignId, changes, recipientContactIds) {
   const client = await createClient();
   const context = await resolveCampaignContext(client);
-  requireCampaignRole(context.role, campaignWriteRoles);
+  if (!context.ok) return context;
 
-  const campaignRecord = normalizeCampaignInput(changes, { partial: true });
+  const roleFailure = requireCampaignRole(context.data.role, campaignWriteRoles);
+  if (roleFailure) return roleFailure;
+
+  const normalized = normalizeCampaignInput(changes, { partial: true });
+  if (normalized.error) return normalized.error;
+  const campaignRecord = normalized.record;
+
   if (recipientContactIds === undefined && !Object.keys(campaignRecord).length) {
-    throw new Error("Provide campaign fields or recipient changes to update.");
+    return actionFailure(
+      "Provide campaign fields or recipient changes to update.",
+      ACTION_ERROR_CODES.VALIDATION
+    );
   }
 
   const { data: originalCampaign, error: lookupError } = await client
     .from("campaigns")
     .select("*")
     .eq("id", campaignId)
-    .eq("organization_id", context.organizationId)
+    .eq("organization_id", context.data.organizationId)
     .maybeSingle();
 
-  if (lookupError) throw new Error(`Could not find the campaign to update: ${lookupError.message}`);
-  if (!originalCampaign) throw new Error("That campaign was not found in your organization.");
+  if (lookupError) {
+    console.error("campaigns: could not look up the campaign to update", lookupError);
+    return actionFailure("Could not find the campaign to update. Please try again.");
+  }
+  if (!originalCampaign) {
+    return actionFailure(
+      "That campaign was not found in your organization.",
+      ACTION_ERROR_CODES.NOT_FOUND
+    );
+  }
+
+  const effectiveStatus = campaignRecord.status ?? originalCampaign.status;
+  const effectiveScheduledAt = Object.hasOwn(campaignRecord, "scheduled_at")
+    ? campaignRecord.scheduled_at
+    : originalCampaign.scheduled_at;
+  const dateFailure = scheduledDateFailure(effectiveStatus, effectiveScheduledAt);
+  if (dateFailure) return dateFailure;
 
   let addedContactIds = [];
   let removedContactIds = [];
@@ -429,21 +600,34 @@ export async function updateCampaign(campaignId, changes, recipientContactIds) {
   let desiredRecipientIds = [];
 
   if (shouldReplaceRecipients) {
-    desiredRecipientIds = normalizeRecipientContactIds(recipientContactIds);
-    await validateOrganizationContacts(client, context.organizationId, desiredRecipientIds);
+    const normalizedRecipients = normalizeRecipientContactIds(recipientContactIds);
+    if (normalizedRecipients.error) return normalizedRecipients.error;
+    desiredRecipientIds = normalizedRecipients.ids;
+
+    const contactFailure = await validateOrganizationContacts(
+      client,
+      context.data.organizationId,
+      desiredRecipientIds
+    );
+    if (contactFailure) return contactFailure;
 
     const existingIds = await listExistingRecipientIds(
       client,
-      context.organizationId,
+      context.data.organizationId,
       campaignId
     );
+    if (existingIds && existingIds.ok === false) return existingIds;
+
     const existingSet = new Set(existingIds);
     const desiredSet = new Set(desiredRecipientIds);
     addedContactIds = desiredRecipientIds.filter((contactId) => !existingSet.has(contactId));
     removedContactIds = existingIds.filter((contactId) => !desiredSet.has(contactId));
 
-    if (removedContactIds.length && !campaignDeleteRoles.includes(context.role)) {
-      throw new Error("Only an ADMIN can remove recipients from a campaign.");
+    if (removedContactIds.length && !campaignDeleteRoles.includes(context.data.role)) {
+      return actionFailure(
+        "Only an ADMIN can remove recipients from a campaign.",
+        ACTION_ERROR_CODES.PERMISSION_DENIED
+      );
     }
   }
 
@@ -455,91 +639,137 @@ export async function updateCampaign(campaignId, changes, recipientContactIds) {
       .from("campaigns")
       .update({ ...campaignRecord, updated_at: new Date().toISOString() })
       .eq("id", campaignId)
-      .eq("organization_id", context.organizationId)
+      .eq("organization_id", context.data.organizationId)
       .select("*")
       .single();
 
-    if (error) throw new Error(`Could not update campaign: ${error.message}`);
+    if (error) {
+      console.error("campaigns: could not update campaign", error);
+      return actionFailure("Could not update the campaign. Please try again.");
+    }
     updatedCampaign = data;
   }
 
+  let removedRecipientIds = [];
+
   try {
-    await insertRecipientAssociations(
+    const insertFailure = await insertRecipientAssociations(
       client,
-      context.organizationId,
+      context.data.organizationId,
       campaignId,
       addedContactIds
     );
-    await removeRecipientAssociations(
+    if (insertFailure) throw insertFailure;
+
+    const removal = await removeRecipientAssociations(
       client,
-      context.organizationId,
+      context.data.organizationId,
       campaignId,
       removedContactIds
     );
+    if (removal.error) throw removal.error;
+
+    removedRecipientIds = removal.removedIds;
+    if (removal.missingIds.length) {
+      throw actionFailure(
+        "Some campaign recipients could not be removed. Check your ADMIN permissions and try again.",
+        ACTION_ERROR_CODES.PERMISSION_DENIED
+      );
+    }
   } catch (recipientError) {
     const rollbackErrors = [];
 
     if (addedContactIds.length) {
       const cleanupError = await cleanupAddedRecipients(
         client,
-        context.organizationId,
+        context.data.organizationId,
         campaignId,
         addedContactIds
       );
       if (cleanupError) rollbackErrors.push(`Added recipients could not be rolled back: ${cleanupError}`);
     }
 
+    // Put back any recipient that was already removed before the failure, so a
+    // partially applied update does not silently drop people from a campaign.
+    if (removedRecipientIds.length) {
+      const restoreError = await restoreRemovedRecipients(
+        client,
+        context.data.organizationId,
+        campaignId,
+        removedRecipientIds
+      );
+      if (restoreError) {
+        rollbackErrors.push(`Removed recipients could not be restored: ${restoreError}`);
+      }
+    }
+
     const campaignRestoreError = await restoreCampaignFields(
       client,
-      context.organizationId,
+      context.data.organizationId,
       campaignId,
       originalCampaign,
       updatedColumns
     );
     if (campaignRestoreError) rollbackErrors.push(campaignRestoreError);
 
-    const originalMessage = recipientError instanceof Error
-      ? recipientError.message
-      : "Could not update campaign recipients.";
+    const originalMessage = recipientError?.error
+      ?? recipientError?.message
+      ?? "Could not update campaign recipients.";
     const rollbackMessage = rollbackErrors.length
       ? ` Rollback was incomplete: ${rollbackErrors.join(" ")}`
       : " Campaign field changes were rolled back.";
 
-    throw new Error(`${originalMessage}${rollbackMessage}`);
+    console.error("campaigns: recipient update failed and was rolled back", recipientError);
+    return actionFailure(`${originalMessage}${rollbackMessage}`);
   }
 
   const countsByCampaignId = shouldReplaceRecipients
     ? { [campaignId]: desiredRecipientIds.length }
-    : await fetchCampaignRecipientCounts(client, context.organizationId, [campaignId]);
+    : await fetchCampaignRecipientCounts(client, context.data.organizationId, [campaignId]);
+  if (countsByCampaignId && countsByCampaignId.ok === false) return countsByCampaignId;
 
-  return {
+  return actionSuccess({
     ...fromCampaignRecord(updatedCampaign),
-    recipientCount: countsByCampaignId[campaignId] ?? 0,
-  };
+    recipientCount: countsByCampaignId?.[campaignId] ?? 0,
+  });
 }
 
 export async function deleteCampaign(campaignId) {
   const client = await createClient();
   const context = await resolveCampaignContext(client);
-  requireCampaignRole(context.role, campaignDeleteRoles);
+  if (!context.ok) return context;
+
+  const roleFailure = requireCampaignRole(context.data.role, campaignDeleteRoles);
+  if (roleFailure) return roleFailure;
 
   const { data, error } = await client
     .from("campaigns")
     .delete()
     .eq("id", campaignId)
-    .eq("organization_id", context.organizationId)
+    .eq("organization_id", context.data.organizationId)
     .select("id")
     .maybeSingle();
 
-  if (error) throw new Error(`Could not delete campaign: ${error.message}`);
-  if (!data) throw new Error("That campaign was not found in your organization.");
+  if (error) {
+    console.error("campaigns: could not delete campaign", error);
+    return actionFailure("Could not delete the campaign. Please try again.");
+  }
+  if (!data) {
+    return actionFailure(
+      "That campaign was not found in your organization.",
+      ACTION_ERROR_CODES.NOT_FOUND
+    );
+  }
 
-  return data.id;
+  return actionSuccess(data.id);
 }
 
 export async function listCampaignRecipientContacts({ page = 1, pageSize = 20 } = {}) {
   const client = await createClient();
-  const { organizationId } = await resolveCampaignContext(client);
+  const context = await resolveCampaignContext(client);
+  if (!context.ok) return context;
+
+  const { organizationId } = context.data;
   const pagination = safePageValues(page, pageSize);
 
   const { data, count, error } = await client
@@ -550,24 +780,33 @@ export async function listCampaignRecipientContacts({ page = 1, pageSize = 20 } 
     .order("id", { ascending: true })
     .range(pagination.offset, pagination.offset + pagination.pageSize - 1);
 
-  if (error) throw new Error(`Could not load contacts for campaign recipients: ${error.message}`);
+  if (error) {
+    console.error("campaigns: could not load contacts for campaign recipients", error);
+    return actionFailure("Could not load the contacts for campaign recipients. Please try again.");
+  }
 
-  return {
+  return actionSuccess({
     contacts: (data ?? []).map(fromContactRecord),
     pagination: {
       ...pagination,
       totalCount: count ?? 0,
       pageCount: getPageCount(count ?? 0, pagination.pageSize),
     },
-  };
+  });
 }
 
 export async function listCampaignRecipientIds(campaignId) {
   const client = await createClient();
-  const { organizationId } = await resolveCampaignContext(client);
+  const context = await resolveCampaignContext(client);
+  if (!context.ok) return context;
+
+  const { organizationId } = context.data;
 
   if (typeof campaignId !== "string" || !campaignId.trim()) {
-    throw new Error("A valid campaign ID is required to load recipients.");
+    return actionFailure(
+      "A valid campaign ID is required to load recipients.",
+      ACTION_ERROR_CODES.VALIDATION
+    );
   }
 
   const { data, error } = await client
@@ -577,27 +816,50 @@ export async function listCampaignRecipientIds(campaignId) {
     .eq("organization_id", organizationId)
     .maybeSingle();
 
-  if (error) throw new Error(`Could not find the campaign: ${error.message}`);
-  if (!data) throw new Error("That campaign was not found in your organization.");
+  if (error) {
+    console.error("campaigns: could not look up the campaign", error);
+    return actionFailure("Could not find the campaign. Please try again.");
+  }
+  if (!data) {
+    return actionFailure(
+      "That campaign was not found in your organization.",
+      ACTION_ERROR_CODES.NOT_FOUND
+    );
+  }
 
-  return listExistingRecipientIds(client, organizationId, campaignId);
+  const recipientIds = await listExistingRecipientIds(client, organizationId, campaignId);
+  if (recipientIds && recipientIds.ok === false) return recipientIds;
+
+  return actionSuccess(recipientIds);
 }
 
 export async function getCampaignRecipientCounts(campaignIds) {
   const client = await createClient();
-  const { organizationId } = await resolveCampaignContext(client);
+  const context = await resolveCampaignContext(client);
+  if (!context.ok) return context;
+
+  const { organizationId } = context.data;
   let scopedCampaignIds = null;
 
   if (campaignIds !== undefined) {
     if (!Array.isArray(campaignIds)) {
-      throw new Error("Campaign IDs must be provided as a list.");
+      return actionFailure(
+        "Campaign IDs must be provided as a list.",
+        ACTION_ERROR_CODES.VALIDATION
+      );
     }
 
     scopedCampaignIds = [...new Set(campaignIds)];
     if (scopedCampaignIds.some((id) => typeof id !== "string" || !id.trim())) {
-      throw new Error("Every campaign must have a valid campaign ID.");
+      return actionFailure(
+        "Every campaign must have a valid campaign ID.",
+        ACTION_ERROR_CODES.VALIDATION
+      );
     }
   }
 
-  return fetchCampaignRecipientCounts(client, organizationId, scopedCampaignIds);
+  const counts = await fetchCampaignRecipientCounts(client, organizationId, scopedCampaignIds);
+  if (counts && counts.ok === false) return counts;
+
+  return actionSuccess(counts);
 }

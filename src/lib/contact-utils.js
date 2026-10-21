@@ -1,3 +1,5 @@
+export const contactStatuses = ["active", "inactive", "archived"];
+
 const contactFieldMap = {
   firstName: "first_name",
   lastName: "last_name",
@@ -75,6 +77,36 @@ export function validatePhoneNumber(phone) {
       valid: false,
       error: "Enter a phone number with 2 to 15 digits and a leading + for international format.",
     };
+  }
+
+  return { valid: true, error: null };
+}
+
+export function validateContactStatus(status) {
+  if (!contactStatuses.includes(status)) {
+    return {
+      valid: false,
+      value: null,
+      error: `Contact status must be one of: ${contactStatuses.join(", ")}.`,
+    };
+  }
+
+  return { valid: true, value: status, error: null };
+}
+
+export function validateContactEmail(email) {
+  if (email == null || (typeof email === "string" && email.trim() === "")) {
+    return { valid: true, error: null };
+  }
+
+  if (typeof email !== "string") {
+    return { valid: false, error: "Email address must be text." };
+  }
+
+  // Deliberately permissive: one "@", no whitespace, a dotted domain.
+  // Catches obvious junk without rejecting unusual but legitimate addresses.
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+    return { valid: false, error: "Enter a valid email address." };
   }
 
   return { valid: true, error: null };
